@@ -1,5 +1,5 @@
 const EFFECT = Symbol.for('cordis.effect')
-const SUPPORTED_RUNTIME = '0.2.0-rc.2'
+const SUPPORTED_RUNTIMES = new Set(['0.2.0-rc.2', '0.2.1-rc.2'])
 const releases = new WeakSet()
 const runtimeVersionTasks = new WeakMap()
 
@@ -57,14 +57,16 @@ function contextFibers(ctx) {
   return [...fibers]
 }
 
-function lifecycleDisposers(ctx, agent, id) {
+function lifecycleDisposers(ctx, agent, id, version) {
   const ownerFibers = contextFibers(ctx)
   const scopeDisposer = agent?.ctx?.fiber?.dispose
   const scopeMeta = typeof scopeDisposer === 'function' ? scopeDisposer[EFFECT] : undefined
   if (ownerFibers === undefined || scopeMeta === undefined || !Array.isArray(scopeMeta.children)) return undefined
 
+  if (!SUPPORTED_RUNTIMES.has(version)) return undefined
   const label = `agentLoop.lifecycle(${id})`
   const matches = []
+  const scopes = []
   for (const fiber of ownerFibers) {
     if (fiber === null || typeof fiber !== 'object' || fiber.uid === null || fiber.state === 5) continue
     const disposables = fiber._disposables
@@ -72,11 +74,23 @@ function lifecycleDisposers(ctx, agent, id) {
     for (const dispose of disposables) {
       if (typeof dispose !== 'function') continue
       const effect = dispose[EFFECT]
-      if (effect?.label === label && Array.isArray(effect.children) && effect.children.includes(scopeMeta)) {
-        matches.push({ fiber, dispose })
-      }
+      if (effect?.label === label) matches.push({ fiber, dispose })
+      if (effect?.label === `agentLoop.scope(${id})` && Array.isArray(effect.children)
+        && effect.children.length === 1 && effect.children[0] === scopeMeta) scopes.push({ fiber, dispose })
     }
   }
+  if (matches.length !== 1) return matches
+  const lifecycle = matches[0].dispose[EFFECT]
+  if (!Array.isArray(lifecycle.children)) return undefined
+  if (version === '0.2.0-rc.2') {
+    return lifecycle.children.includes(scopeMeta) ? matches : undefined
+  }
+  // 0.2.1 splits factory-owned scope cleanup from caller-owned lifecycle
+  // teardown. Match both exact identities before invoking the lifecycle;
+  // disposing the scope alone would leave its writer and registrations alive.
+  if (agent.scope?.ctx?.fiber !== agent.ctx.fiber || agent.scope?.rawDispose !== scopeDisposer
+    || scopes.length !== 1 || scopes[0].fiber !== agent.loopCtx?.fiber
+    || lifecycle.children.length !== 0) return undefined
   return matches
 }
 
@@ -92,7 +106,7 @@ function pendingInput(agent) {
   }
 }
 
-function inspectPair(ctx, id) {
+function inspectPair(ctx, id, version) {
   const agents = lookup(ctx?.agents, id)
   const sessions = lookup(ctx?.sessions, id)
   if (!agents.known || !sessions.known) {
@@ -114,7 +128,7 @@ function inspectPair(ctx, id) {
     const pending = pendingInput(agent)
     if (!pending.known) return { active: true, canRelease: false, busy: false, reason: 'unsupported' }
     if (pending.count !== 0) return { active: true, canRelease: false, busy: true, reason: 'queued-input' }
-    const matches = lifecycleDisposers(ctx, agent, id)
+    const matches = lifecycleDisposers(ctx, agent, id, version)
     if (matches === undefined || matches.length !== 1) return { active: true, canRelease: false, busy: false, reason: 'unsupported' }
     if (typeof ctx.sessionPersistence?.open !== 'function') {
       return { active: true, canRelease: false, busy: false, reason: 'unsupported' }
@@ -125,20 +139,13 @@ function inspectPair(ctx, id) {
   }
 }
 
-/** Read the exact 0.2.0-rc.2 live Agent/session ownership state without changing it. */
+/** Read the verified runtime's live Agent/session ownership without changing it. */
 export async function inspectLiveSession(ctx, id) {
   if (typeof id !== 'string' || id.trim() === '') {
     return { active: false, canRelease: false, busy: false, reason: 'unsupported' }
   }
-  const first = inspectPair(ctx, id)
-  if (!first.active || !first.canRelease) {
-    const { agent: _agent, session: _session, fiber: _fiber, dispose: _dispose, ...result } = first
-    return result
-  }
-  if (await runtimeVersion(ctx) !== SUPPORTED_RUNTIME) {
-    return { active: true, canRelease: false, busy: false, reason: 'unsupported' }
-  }
-  const { agent: _agent, session: _session, fiber: _fiber, dispose: _dispose, ...result } = inspectPair(ctx, id)
+  const version = await runtimeVersion(ctx)
+  const { agent: _agent, session: _session, fiber: _fiber, dispose: _dispose, ...result } = inspectPair(ctx, id, version)
   return result
 }
 
@@ -210,12 +217,11 @@ function requireIdleAndEmpty(agent) {
 /** Drain and release one exact idle Native Agent lifecycle without unloading its owner fiber. */
 export async function releaseLiveSession(ctx, id) {
   if (typeof id !== 'string' || id.trim() === '') throw new LiveSessionError('unsupported', 'session id must be non-empty')
-  const preflight = inspectPair(ctx, id)
-  if (!preflight.canRelease) throw new LiveSessionError(preflight.reason, `cannot safely release session ${JSON.stringify(id)}: ${preflight.reason}`)
-  if (await runtimeVersion(ctx) !== SUPPORTED_RUNTIME) throw new LiveSessionError('unsupported', `live Agent release requires DSH ${SUPPORTED_RUNTIME}`)
+  const version = await runtimeVersion(ctx)
+  if (!SUPPORTED_RUNTIMES.has(version)) throw new LiveSessionError('unsupported', 'live Agent release requires a verified DSH runtime')
   // The version lookup yields to the event loop; re-check all ownership and
   // idle facts after it, then fence input without another await.
-  const inspection = inspectPair(ctx, id)
+  const inspection = inspectPair(ctx, id, version)
   if (!inspection.canRelease) throw new LiveSessionError(inspection.reason, `cannot safely release session ${JSON.stringify(id)}: ${inspection.reason}`)
   const { agent, session, fiber, dispose } = inspection
   if (releases.has(agent)) throw new LiveSessionError('release-in-progress', 'live session release is already in progress')
@@ -231,7 +237,7 @@ export async function releaseLiveSession(ctx, id) {
     if (ctx.agents.get(id) !== agent || ctx.sessions.get(id) !== session) {
       throw new LiveSessionError('live-session-changed', 'live Agent or Session changed during workspace migration')
     }
-    const matches = lifecycleDisposers(ctx, agent, id)
+    const matches = lifecycleDisposers(ctx, agent, id, version)
     if (matches === undefined || matches.length !== 1 || matches[0].fiber !== fiber || matches[0].dispose !== dispose) {
       throw new LiveSessionError('lifecycle-owner-changed', 'the exact Native lifecycle owner changed during workspace migration')
     }

@@ -33,7 +33,7 @@ async function contextFor(root, compression) {
     StorageDomain,
     { default: SessionProjectionRegistry },
     { default: SessionStore },
-    { default: Persistence },
+    Persistence,
     { default: WorkspaceRegistry },
     { default: AgentRegistry },
     { default: LlmRuntime },
@@ -58,17 +58,17 @@ async function contextFor(root, compression) {
     nativeImport('dsh-session'),
   ])
   const ctx = new Context()
-  await ctx.plugin(Storage)
-  await ctx.plugin(StorageJson, { root: join(root, 'storages') })
-  await ctx.plugin(StorageDomain, { backend: 'json' })
-  await ctx.plugin(SessionProjectionRegistry)
-  await ctx.plugin(SessionStore)
-  await ctx.plugin(Persistence, { root: join(root, 'sessions'), compression })
-  await ctx.plugin(AgentRegistry)
-  await ctx.plugin(LlmRuntime)
-  await ctx.plugin(SystemPrompt)
-  await ctx.plugin(ToolRuntime)
-  await ctx.plugin(AgentLoop, { agents: [] })
+  await ctx.plugin(Storage).await()
+  await ctx.plugin(StorageJson, { root: join(root, 'storages') }).await()
+  await ctx.plugin(StorageDomain, { backend: 'json' }).await()
+  await ctx.plugin(SessionProjectionRegistry).await()
+  await ctx.plugin(SessionStore).await()
+  await ctx.plugin(Persistence.default ?? Persistence, { root: join(root, 'sessions'), compression }).await()
+  await ctx.plugin(AgentRegistry).await()
+  await ctx.plugin(LlmRuntime).await()
+  await ctx.plugin(SystemPrompt).await()
+  await ctx.plugin(ToolRuntime).await()
+  await ctx.plugin(AgentLoop, { agents: [] }).await()
   return { ctx, Session, SESSION_FORMAT_VERSION, WorkspaceRegistry }
 }
 
@@ -180,7 +180,7 @@ test('live release preserves two idle agents, closes one Native writer, and resu
       const controlId = `live-control-${compression}`
       const original = await seedSession(ctx, stack.Session, stack.SESSION_FORMAT_VERSION, id, sourcePath)
       const controlOriginal = await seedSession(ctx, stack.Session, stack.SESSION_FORMAT_VERSION, controlId, sourcePath)
-      await ctx.plugin(stack.WorkspaceRegistry)
+      await ctx.plugin(stack.WorkspaceRegistry).await()
       const [sourceWorkspace] = ctx.workspaceRegistry.list()
       assert.ok(sourceWorkspace, 'Native workspace bootstrap should find both seeded histories')
       assert.deepEqual(new Set(sourceWorkspace.sessionIds), new Set([id, controlId]))
@@ -303,7 +303,7 @@ test('inspection refuses queued, maintained, unknown, and ambiguous live Agent s
     ctx = stack.ctx
     const id = 'live-release-guard'
     const original = await seedSession(ctx, stack.Session, stack.SESSION_FORMAT_VERSION, id, cwd)
-    await ctx.plugin(stack.WorkspaceRegistry)
+    await ctx.plugin(stack.WorkspaceRegistry).await()
     handle = await ctx.agents.resume({ resumeSessionId: id, agentOptions: { provider: 'fixture', model: 'fixture' } })
     const agent = handle.agent
 
@@ -335,6 +335,15 @@ test('inspection refuses queued, maintained, unknown, and ambiguous live Agent s
     }
     assert.deepEqual(await inspectLiveSession(noOwnerContext, id), { active: true, canRelease: false, busy: false, reason: 'unsupported' })
     await assert.rejects(releaseLiveSession(noOwnerContext, id), error => error instanceof LiveSessionError && error.code === 'unsupported')
+    assert.deepEqual(await readFile(ctx.sessionPersistence.locate(original.header).path), protectedBytes)
+
+    const unknownVersionContext = {
+      agents: ctx.agents, sessions: ctx.sessions, sessionPersistence: ctx.sessionPersistence,
+      root: ctx.root, fiber: ctx.fiber,
+      get: name => name === 'loader' ? { import: async () => ({ getDshRuntimeVersion: () => '0.2.2-untested' }) } : undefined,
+    }
+    assert.deepEqual(await inspectLiveSession(unknownVersionContext, id), { active: true, canRelease: false, busy: false, reason: 'unsupported' })
+    await assert.rejects(releaseLiveSession(unknownVersionContext, id), error => error instanceof LiveSessionError && error.code === 'unsupported')
     assert.deepEqual(await readFile(ctx.sessionPersistence.locate(original.header).path), protectedBytes)
 
     const effectSymbol = Symbol.for('cordis.effect')
@@ -375,7 +384,7 @@ test('warm Native workspace move releases only the selected idle Agent and resum
     const original = await seedSession(ctx, stack.Session, stack.SESSION_FORMAT_VERSION, id, sourcePath)
     await seedSession(ctx, stack.Session, stack.SESSION_FORMAT_VERSION, controlId, sourcePath)
     await seedSession(ctx, stack.Session, stack.SESSION_FORMAT_VERSION, anchorId, targetPath)
-    await ctx.plugin(stack.WorkspaceRegistry)
+    await ctx.plugin(stack.WorkspaceRegistry).await()
     const sourceWorkspace = ctx.workspaceRegistry.list().find(workspace => workspace.sessionIds.includes(id))
     const targetWorkspace = ctx.workspaceRegistry.list().find(workspace => workspace.sessionIds.includes(anchorId))
     assert.ok(sourceWorkspace && targetWorkspace && sourceWorkspace !== targetWorkspace)

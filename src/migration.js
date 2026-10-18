@@ -209,7 +209,29 @@ async function validateCurrentArtifact(persistence, content) {
     restore = sessionFormatCatalog.createRestore(header, { recovery: 'strict', validation: 'current' })
   }
   for (const line of lines) restore.decodeRow(JSON.parse(line))
-  restore.finish()
+  return restore.finish()
+}
+
+async function prepareNativeArtifact(persistence, content, targetPath) {
+  const rewritten = rewriteRawArtifact(content, targetPath)
+  if (!rewritten.content.endsWith('\n')) fail('invalid-artifact', 'the session artifact has an incomplete final line')
+  const restored = await validateCurrentArtifact(persistence, rewritten.content)
+  if (persistence.generationFormat.currentVersion !== 4) return rewritten
+  const lastDirectory = restored.events.findLast(event => event.type === 'working-directory/change')
+  if (lastDirectory === undefined || lastDirectory.data.cwd === targetPath) return rewritten
+
+  // 0.2.1 projects the last committed directory over header.cwd. Keep the
+  // complete old row bytes as a prefix and commit a new destination selection.
+  const { sessionFormatCatalog } = await import('@deepseek-ai/dsh-session-format-catalog')
+  const event = {
+    type: 'working-directory/change',
+    seq: restored.events.length,
+    time: Math.max(Date.now(), restored.events.at(-1)?.time ?? 0),
+    data: { cwd: targetPath },
+  }
+  rewritten.content += JSON.stringify(sessionFormatCatalog.encodeCurrentEvent(event)) + '\n'
+  await validateCurrentArtifact(persistence, rewritten.content)
+  return rewritten
 }
 
 async function generationFiles(directory) {
@@ -264,13 +286,10 @@ async function moveNativeSession(ctx, sessionId, target, workspaces, originalWor
     for (const name of names) revisions.set(name, await stat(join(sourceDirectory, name), { bigint: true }))
     const raw = await readFile(source)
     const content = await decodeArtifact(raw, source)
-    const rewritten = rewriteRawArtifact(content, target.path)
+    const rewritten = await prepareNativeArtifact(persistence, content, target.path)
     if (rewritten.meta.id !== sessionId || JSON.parse(content.slice(0, newlineAt(content))).cwd !== header.cwd) {
       fail('source-changed', 'the stored header changed while preparing the move')
     }
-    // Validate the complete current artifact through the host's own catalog.
-    if (!rewritten.content.endsWith('\n')) fail('invalid-artifact', 'the session artifact has an incomplete final line')
-    await validateCurrentArtifact(persistence, rewritten.content)
     const destinationLocation = persistence.locate({ ...header, cwd: target.path })
     if (destinationLocation?.kind !== 'jsonl' || typeof destinationLocation.path !== 'string') {
       fail('unsupported-persistence', 'the target session artifact cannot be located')

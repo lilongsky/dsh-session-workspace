@@ -15,7 +15,7 @@ async function contextFor(root, compression) {
     { default: Storage },
     StorageJson,
     StorageDomain,
-    { default: Persistence },
+    Persistence,
     { default: WorkspaceRegistry },
   ] = await Promise.all([
     nativeImport('cordis'),
@@ -26,10 +26,10 @@ async function contextFor(root, compression) {
     nativeImport('dsh-workspace'),
   ])
   const ctx = new Context()
-  await ctx.plugin(Storage)
-  await ctx.plugin(StorageJson, { root: join(root, 'storages') })
-  await ctx.plugin(StorageDomain, { backend: 'json' })
-  await ctx.plugin(Persistence, { root: join(root, 'sessions'), compression })
+  await ctx.plugin(Storage).await()
+  await ctx.plugin(StorageJson, { root: join(root, 'storages') }).await()
+  await ctx.plugin(StorageDomain, { backend: 'json' }).await()
+  await ctx.plugin(Persistence.default ?? Persistence, { root: join(root, 'sessions'), compression }).await()
   return { ctx, WorkspaceRegistry }
 }
 
@@ -64,7 +64,7 @@ async function seedSession(ctx, id, cwd) {
 }
 
 async function startRegistry(ctx, WorkspaceRegistry) {
-  await ctx.plugin(WorkspaceRegistry)
+  await ctx.plugin(WorkspaceRegistry).await()
   return ctx.workspaceRegistry
 }
 
